@@ -12,6 +12,7 @@ dependencies = [
     "ipykernel>=7.4.0",
     "langchain>=1.4.3",
     "langchain-anthropic>=1.7.5",
+    "langchain-community>=0.4.2",
     "langchain-tavily>=0.2.18",
 ]
 
