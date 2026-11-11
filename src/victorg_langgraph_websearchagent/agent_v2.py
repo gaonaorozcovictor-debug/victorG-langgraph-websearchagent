@@ -29,6 +29,10 @@ KNOWLEDGE_CUTOFF = "julio de 2025"  # training data cutoff de claude-haiku-4-5
 SEARCH_TOOL_NAME = "tavily_search"
 PRICE_INPUT_PER_MTOK = 1.0   # USD por millón de tokens de entrada (claude-haiku-4-5)
 PRICE_OUTPUT_PER_MTOK = 5.0  # USD por millón de tokens de salida (claude-haiku-4-5)
+PRICE_CACHE_WRITE_5M_PER_MTOK = 1.25  # escribir en caché (5 min): +25% sobre el input
+PRICE_CACHE_WRITE_1H_PER_MTOK = 2.0   # escribir en caché (1 h)
+PRICE_CACHE_READ_PER_MTOK = 0.10      # leer de caché: -90% sobre el input
+MIN_CACHEABLE_TOKENS = 4096           # mínimo cacheable de Haiku 4.5 (por debajo no se cachea)
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +49,36 @@ def load_keys():
 
     if not os.environ.get("TAVILY_API_KEY"):
         os.environ["TAVILY_API_KEY"] = getpass.getpass("Tavily API key:\n").strip()
+
+
+def check_keys():
+    """Comprueba las dos claves con llamadas mínimas ANTES de lanzar los experimentos.
+
+    Así un error de clave se ve en 2 segundos y no a mitad de un notebook de pago.
+    """
+    ok = True
+    try:
+        init_chat_model(MODEL_NAME, temperature=0, max_tokens=5).invoke("Di hola")
+        print("Anthropic: OK")
+    except Exception as e:
+        ok = False
+        print(f"Anthropic: FALLA -> {type(e).__name__}: {str(e)[:150]}")
+    try:
+        from langchain_tavily._utilities import TavilySearchAPIWrapper
+
+        TavilySearchAPIWrapper().raw_results(
+            query="test", max_results=1, search_depth="basic", include_domains=None,
+            exclude_domains=None, include_answer=False, include_raw_content=False,
+            include_images=False, include_image_descriptions=False, include_favicon=False,
+            topic="general", time_range=None, country=None, auto_parameters=False,
+            start_date=None, end_date=None, include_usage=False, exact_match=False,
+        )
+        print("Tavily: OK")
+    except Exception as e:
+        ok = False
+        print(f"Tavily: FALLA -> {type(e).__name__}: {str(e)[:150]}")
+    if not ok:
+        raise RuntimeError("Revisa las claves del .env y reinicia el kernel.")
 
 
 # ---------------------------------------------------------------------------
@@ -72,10 +106,16 @@ def multiply(a: int, b: int) -> int:
 DEFAULT_SEARCH_KWARGS = {"max_results": 5, "topic": "general"}
 
 
-def build_tools(use_search: bool = True, search_kwargs: dict | None = None) -> list:
-    """Lista de herramientas del agente. search_kwargs configura TavilySearch."""
+def build_tools(use_search: bool = True, search_kwargs: dict | None = None, search_tool=None) -> list:
+    """Lista de herramientas del agente.
+
+    search_kwargs configura TavilySearch. Si se pasa search_tool, sustituye a TavilySearch
+    (p. ej. la tool "lean" del Paso 3).
+    """
     tools = [multiply]
-    if use_search:
+    if search_tool is not None:
+        tools.append(search_tool)
+    elif use_search:
         kwargs = DEFAULT_SEARCH_KWARGS if search_kwargs is None else search_kwargs
         tools.append(TavilySearch(**kwargs))
     return tools
@@ -121,18 +161,35 @@ def build_system_prompt(use_search: bool = True) -> SystemMessage:
 # ---------------------------------------------------------------------------
 # Construir el agente (use_search=False => el mismo agente SIN búsqueda web)
 # ---------------------------------------------------------------------------
-def build_search_agent(use_search: bool = True, search_kwargs: dict | None = None):
-    """Crea y compila el agente (modelo + herramientas + grafo)."""
-    model = init_chat_model(MODEL_NAME, temperature=0)
+def build_search_agent(
+    use_search: bool = True,
+    search_kwargs: dict | None = None,
+    search_tool=None,
+    cache: bool = False,
+    memory: bool = False,
+    model=None,
+):
+    """Crea y compila el agente (modelo + herramientas + grafo).
 
-    tools = build_tools(use_search, search_kwargs)
+    search_tool: tool de búsqueda propia en lugar de TavilySearch.
+    cache:       activa el prompt caching automático de Anthropic en cada llamada.
+    memory:      guarda la conversación por thread_id (necesario para varias preguntas seguidas).
+    model:       modelo ya creado (para pruebas); por defecto Haiku 4.5.
+    """
+    model = model or init_chat_model(MODEL_NAME, temperature=0)
+
+    use_search = use_search or search_tool is not None
+    tools = build_tools(use_search, search_kwargs, search_tool)
 
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
     system_prompt = build_system_prompt(use_search)
 
+    # El caching automático mueve el punto de caché al último bloque de cada petición
+    cache_kwargs = {"cache_control": {"type": "ephemeral"}} if cache else {}
+
     def llm_call(state: dict):
-        response = model_with_tools.invoke([system_prompt] + state["messages"])
+        response = model_with_tools.invoke([system_prompt] + state["messages"], **cache_kwargs)
         return {
             "messages": [response],
             "llm_calls": state.get("llm_calls", 0) + 1,
@@ -143,6 +200,11 @@ def build_search_agent(use_search: bool = True, search_kwargs: dict | None = Non
         for tool_call in state["messages"][-1].tool_calls:
             selected_tool = tools_by_name[tool_call["name"]]
             try:
+                if getattr(selected_tool, "response_format", "content") == "content_and_artifact":
+                    # La tool devuelve texto para el LLM y un artifact (datos crudos) que NO se
+                    # envía al modelo: sirve para analizar sin gastar tokens.
+                    result.append(selected_tool.invoke(tool_call))
+                    continue
                 observation = selected_tool.invoke(tool_call["args"])
             except Exception as e:  # p. ej. Tavily sin resultados (ToolException)
                 observation = {"error": str(e)}
@@ -168,15 +230,29 @@ def build_search_agent(use_search: bool = True, search_kwargs: dict | None = Non
     agent_builder.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
     agent_builder.add_edge("tool_node", "llm_call")
 
+    if memory:
+        from langgraph.checkpoint.memory import MemorySaver
+
+        return agent_builder.compile(checkpointer=MemorySaver())
     return agent_builder.compile()
 
 
 # ---------------------------------------------------------------------------
 # Ejecutar el agente (devuelve el estado completo para poder analizarlo)
 # ---------------------------------------------------------------------------
-def run_agent(agent, question: str, verbose: bool = False) -> dict:
-    """Lanza el agente y devuelve el resultado completo (mensajes + contador)."""
-    result = agent.invoke({"messages": [HumanMessage(content=question)]})
+def run_agent(agent, question: str, verbose: bool = False, thread_id: str | None = None) -> dict:
+    """Lanza el agente y devuelve el resultado completo (mensajes + contador).
+
+    Con thread_id (y un agente con memory=True) la conversación continúa donde se dejó;
+    el resultado solo contiene los mensajes de ESTA pregunta, para medir cada turno.
+    """
+    config = {"configurable": {"thread_id": thread_id}} if thread_id else None
+    result = agent.invoke({"messages": [HumanMessage(content=question)]}, config)
+
+    if thread_id:
+        messages = result["messages"]
+        start = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
+        result = {**result, "messages": messages[start:]}
 
     if verbose:
         for m in result["messages"]:
@@ -329,8 +405,17 @@ def print_tool_messages(result: dict, max_chars: int = 300):
                 print(f"    URL:   {r.get('url')}")
                 print(f"    Score: {r.get('score')}")
                 print(f"    Texto: {content[:max_chars]}{'...' if len(content) > max_chars else ''}\n")
-        else:  # otras herramientas (p. ej. multiply)
+        else:  # otras herramientas (p. ej. multiply) o la tool "lean" (texto compacto)
             print(f"Resultado: {data}")
+
+        artifact = getattr(tm, "artifact", None)
+        if isinstance(artifact, dict) and "descartados" in artifact:
+            print(
+                f"\n[artifact] devueltos por Tavily: {artifact.get('n_devueltos')} | "
+                f"inyectados al LLM: {len(artifact['results'])} | descartados: {len(artifact['descartados'])}"
+            )
+            for d in artifact["descartados"]:
+                print(f"  descartado: {d.get('titulo')} ({d.get('motivo')})")
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +572,9 @@ def get_tavily_outputs(result: dict) -> list[dict]:
     outputs = []
     for tm in get_tool_messages(result):
         if tm.name == SEARCH_TOOL_NAME:
+            if isinstance(getattr(tm, "artifact", None), dict):  # tool "lean": datos en el artifact
+                outputs.append(tm.artifact)
+                continue
             try:
                 outputs.append(json.loads(tm.content))
             except (json.JSONDecodeError, TypeError):
@@ -924,6 +1012,19 @@ def unsupported_numbers(answer: str, sources: str) -> list[str]:
     return sorted(missing)
 
 
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+         "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def today_source() -> str:
+    """La fecha de hoy es una fuente legítima: el agente la recibe en el system prompt."""
+    d = date.today()
+    return (
+        f"Fecha actual (system prompt del agente): {d.day} de {MESES[d.month - 1]} de {d.year} "
+        f"({d.strftime('%d/%m/%Y')}, {d.isoformat()})."
+    )
+
+
 def judge_groundedness(
     answer: str, outputs: list[dict], judge_model=None, extra_sources: list[str] | None = None
 ) -> GroundednessJudgement:
@@ -935,7 +1036,13 @@ def judge_groundedness(
         "no tu propio conocimiento: si una afirmación no aparece en ellas, no está respaldada.\n"
         "- Los resultados de herramientas (p. ej. multiply) también son fuentes válidas.\n"
         "- Si una afirmación aparece en las fuentes, aunque sea en otro idioma, SÍ está respaldada.\n"
-        "- Una afirmación respaldada no debe aparecer en 'afirmaciones_sin_respaldo'.\n\n"
+        "- Una afirmación respaldada no debe aparecer en 'afirmaciones_sin_respaldo'.\n"
+        "- La fecha actual figura entre las fuentes: mencionarla está respaldado.\n"
+        "- Comprueba solo si la afirmación APARECE en las fuentes; no juzgues si es plausible ni coherente.\n"
+        "- Si las fuentes se contradicen, la afirmación está respaldada si aparece en alguna.\n"
+        "- Ignora cortesías, recomendaciones y frases como 'según la información actual'.\n"
+        "- Decir que no se encontró información NO es una afirmación factual; en cambio, afirmar que "
+        "algo 'no existe' o añadir datos propios sobre el tema SÍ lo es.\n\n"
         f"FUENTES:\n{sources_text(outputs, extra_sources)}\n\nRESPUESTA:\n{answer}"
     )
     return judge.invoke(prompt)
@@ -951,7 +1058,7 @@ def evaluate_groundedness(queries: list[dict], results: list[dict], judge_model=
         outputs = [o for o in get_tavily_outputs(r) if "results" in o]
         if not outputs:
             continue
-        extra = tool_sources(r)
+        extra = tool_sources(r) + [today_source()]
         answer = get_answer(r)
         verdict = judge_groundedness(answer, outputs, judge_model, extra)
         evaluations.append(
@@ -980,6 +1087,433 @@ def print_groundedness(evaluations: list[dict]):
             if e["numeros_sin_respaldo"]:
                 print(f"    números que no están en las fuentes: {e['numeros_sin_respaldo']}")
             print(f"    juez: {e['explicacion']}")
+
+
+# ---------------------------------------------------------------------------
+# PASO 3: mejorar coste y relevancia (tool "lean", filtros, juez LLM, caché)
+# ---------------------------------------------------------------------------
+class ResultRelevance(RelevanceJudgement):
+    """Valoración de un resultado concreto dentro de un lote (indice = posición en la lista)."""
+
+    indice: int = Field(description="Posición del resultado en la lista recibida, empezando en 0")
+
+
+class RelevanceBatch(BaseModel):
+    """Valoración de todos los resultados de una búsqueda en una sola llamada."""
+
+    valoraciones: list[ResultRelevance]
+
+
+def _shorten(text: str, max_chars: int | None) -> str:
+    """Recorta un texto a max_chars (None = sin recorte)."""
+    if not max_chars or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
+
+
+def rate_results(query: str, results: list[dict], judge_model=None, max_chars: int = 500) -> dict:
+    """Un LLM puntúa (relevancia 0-3 + explicación) TODOS los resultados en UNA llamada.
+
+    Devuelve {"valoraciones": [...], "tokens": {...}}. Si el juez falla, no filtra nada
+    (fail-open): preferimos gastar tokens a perder información útil.
+    """
+    empty = {"input": 0, "output": 0}
+    if not results:
+        return {"valoraciones": [], "tokens": empty}
+
+    model = judge_model or init_chat_model(MODEL_NAME, temperature=0)
+    judge = model.with_structured_output(RelevanceBatch, include_raw=True)
+    listing = "\n\n".join(
+        f"[{i}] Título: {r.get('title')}\nFragmento: {_shorten(r.get('content', ''), max_chars)}"
+        for i, r in enumerate(results)
+    )
+    prompt = (
+        "Valora la relevancia de cada resultado de un buscador para la consulta "
+        "(0 = irrelevante, 1 = poco relevante, 2 = relevante, 3 = responde directamente).\n\n"
+        f"Consulta: {query}\n\nResultados:\n{listing}"
+    )
+    out = judge.invoke(prompt)
+    usage = getattr(out.get("raw"), "usage_metadata", None) or {}
+    tokens = {"input": usage.get("input_tokens", 0), "output": usage.get("output_tokens", 0)}
+
+    parsed = out.get("parsed")
+    if parsed is None:  # fail-open
+        return {"valoraciones": [], "tokens": tokens}
+    by_index = {v.indice: v for v in parsed.valoraciones}
+    ratings = [
+        {"relevancia": by_index[i].relevancia, "explicacion": by_index[i].explicacion}
+        if i in by_index
+        else {"relevancia": None, "explicacion": "sin valoración"}
+        for i in range(len(results))
+    ]
+    return {"valoraciones": ratings, "tokens": tokens}
+
+
+STRICT_EMPTY_MESSAGE = (
+    "No se encontraron resultados fiables para: {query}. Responde únicamente que no has "
+    "encontrado información fiable sobre ello. No sugieras causas, no digas que algo no existe "
+    "y no añadas datos de tu propio conocimiento."
+)
+
+
+def format_results(query: str, results: list[dict], empty_message: str | None = None) -> str:
+    """Texto compacto para el LLM: solo título, url y fragmento (sin JSON, sin score).
+
+    empty_message: texto alternativo (con {query}) cuando no hay resultados.
+    """
+    if not results:
+        if empty_message:
+            return empty_message.replace("{query}", query)
+        return (
+            f"No se encontraron resultados fiables para: {query}. "
+            "No inventes datos: indica al usuario que no hay información fiable."
+        )
+    blocks = [
+        f"[{i}] {r.get('title')} ({r.get('url')})\n{r.get('content', '')}"
+        for i, r in enumerate(results, 1)
+    ]
+    return "\n\n".join(blocks)
+
+
+def tavily_raw_search(
+    query: str,
+    max_results: int = 5,
+    search_depth: str = "basic",
+    topic: str = "general",
+    chunks_per_source: int | None = None,
+) -> dict:
+    """Llama a Tavily a través del wrapper, que sí permite chunks_per_source."""
+    from langchain_tavily._utilities import TavilySearchAPIWrapper
+
+    wrapper = TavilySearchAPIWrapper()
+    base = dict(
+        query=query,
+        max_results=max_results,
+        search_depth=search_depth,
+        include_domains=None,
+        exclude_domains=None,
+        include_answer=False,
+        include_raw_content=False,
+        include_images=False,
+        include_image_descriptions=False,
+        include_favicon=False,
+        topic=topic,
+        time_range=None,
+        country=None,
+        auto_parameters=False,
+        start_date=None,
+        end_date=None,
+        include_usage=False,
+        exact_match=False,
+    )
+    if chunks_per_source is None:
+        return wrapper.raw_results(**base)
+    try:
+        return wrapper.raw_results(**base, chunks_per_source=chunks_per_source)
+    except Exception as e:  # si la API rechaza el parámetro, seguimos sin él y lo anotamos
+        out = wrapper.raw_results(**base)
+        out["aviso"] = f"chunks_per_source ignorado: {e}"
+        return out
+
+
+class LeanSearchInput(BaseModel):
+    """Único parámetro visible para el LLM: el resto se fija al construir la tool."""
+
+    query: str = Field(description="Consulta de búsqueda web")
+
+
+def build_lean_search_tool(
+    max_results: int = 5,
+    search_depth: str = "basic",
+    topic: str = "general",
+    chunks_per_source: int | None = None,
+    max_chars: int | None = None,
+    min_score: float | None = None,
+    top_k: int | None = None,
+    llm_judge: bool = False,
+    min_relevance: int = 2,
+    judge_model=None,
+    search_fn=None,
+    empty_message: str | None = None,
+):
+    """Tool de búsqueda "ligera" con el mismo nombre que la de Tavily (tavily_search).
+
+    Reduce el coste en tres niveles:
+      1. Schema: solo expone `query` y una descripción corta (menos tokens en CADA llamada).
+      2. Parámetros: max_results, chunks_per_source, max_chars (menos texto inyectado).
+      3. Filtros: min_score, top_k y/o juez LLM (no inyecta resultados poco relevantes).
+
+    Devuelve texto compacto al LLM y deja los datos crudos en el artifact (no cuestan tokens).
+    search_fn permite sustituir Tavily (pruebas offline).
+    """
+    from langchain_core.tools import StructuredTool
+
+    search = search_fn or tavily_raw_search
+
+    def _search(query: str):
+        raw = search(
+            query=query,
+            max_results=max_results,
+            search_depth=search_depth,
+            topic=topic,
+            chunks_per_source=chunks_per_source,
+        )
+        found = list(raw.get("results", []))
+        kept, dropped = list(found), []
+        judge_tokens = {"input": 0, "output": 0}
+        ratings = []
+
+        def drop(items, reason):
+            for r in items:
+                dropped.append({"titulo": r.get("title"), "score": r.get("score"), "motivo": reason})
+
+        if min_score is not None:  # 1) filtro por score de Tavily (gratis)
+            drop([r for r in kept if (r.get("score") or 0) < min_score], f"score < {min_score}")
+            kept = [r for r in kept if (r.get("score") or 0) >= min_score]
+        if top_k is not None and len(kept) > top_k:  # 2) solo los k mejores
+            drop(kept[top_k:], f"fuera del top {top_k}")
+            kept = kept[:top_k]
+        if llm_judge and kept:  # 3) juez LLM (cuesta tokens, pero filtra por significado)
+            judged = rate_results(query, kept, judge_model)
+            judge_tokens = judged["tokens"]
+            ratings = judged["valoraciones"]
+            if ratings:
+                keep_flags = [(v["relevancia"] is None) or v["relevancia"] >= min_relevance for v in ratings]
+                drop([r for r, k in zip(kept, keep_flags) if not k], f"relevancia < {min_relevance}")
+                kept = [r for r, k in zip(kept, keep_flags) if k]
+
+        final = [{**r, "content": _shorten(r.get("content", ""), max_chars)} for r in kept]
+        artifact = {
+            "query": query,
+            "results": final,
+            "descartados": dropped,
+            "n_devueltos": len(found),
+            "valoraciones": ratings,
+            "juez_tokens": judge_tokens,
+            "aviso": raw.get("aviso"),
+        }
+        return format_results(query, final, empty_message), artifact
+
+    return StructuredTool.from_function(
+        func=_search,
+        name=SEARCH_TOOL_NAME,
+        description="Busca en la web información actual. Devuelve fragmentos con título y url.",
+        args_schema=LeanSearchInput,
+        response_format="content_and_artifact",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Coste (con caché y juez) y comparación de variantes
+# ---------------------------------------------------------------------------
+def cost_breakdown(result: dict) -> dict:
+    """Coste en USD de una ejecución, separando agente y juez, y desglosando la caché.
+
+    langchain-anthropic suma los tokens de caché dentro de input_tokens, así que se restan
+    para valorar cada tipo a su precio: normal $1, escritura 5m $1.25, escritura 1h $2, lectura $0.10.
+    """
+    plain = read = w5 = w1 = out = 0
+    for m in result["messages"]:
+        if not (isinstance(m, AIMessage) and m.usage_metadata):
+            continue
+        u = m.usage_metadata
+        details = u.get("input_token_details") or {}
+        r = details.get("cache_read", 0) or 0
+        w_total = details.get("cache_creation", 0) or 0
+        w1h = details.get("ephemeral_1h_input_tokens", 0) or 0
+        w5m = (details.get("ephemeral_5m_input_tokens", 0) or 0) or max(w_total - w1h, 0)
+        read += r
+        w5 += w5m
+        w1 += w1h
+        plain += max(u["input_tokens"] - r - w5m - w1h, 0)
+        out += u["output_tokens"]
+
+    agent_usd = (
+        plain * PRICE_INPUT_PER_MTOK
+        + read * PRICE_CACHE_READ_PER_MTOK
+        + w5 * PRICE_CACHE_WRITE_5M_PER_MTOK
+        + w1 * PRICE_CACHE_WRITE_1H_PER_MTOK
+        + out * PRICE_OUTPUT_PER_MTOK
+    ) / 1e6
+
+    j_in = j_out = 0
+    for tm in get_tool_messages(result):
+        art = getattr(tm, "artifact", None)
+        if isinstance(art, dict):
+            j_in += art.get("juez_tokens", {}).get("input", 0)
+            j_out += art.get("juez_tokens", {}).get("output", 0)
+    judge_usd = (j_in * PRICE_INPUT_PER_MTOK + j_out * PRICE_OUTPUT_PER_MTOK) / 1e6
+
+    return {
+        "agente_usd": agent_usd,
+        "juez_usd": judge_usd,
+        "total_usd": agent_usd + judge_usd,
+        "input_normal": plain,
+        "cache_read": read,
+        "cache_write": w5 + w1,
+        "output": out,
+        "juez_tokens": j_in + j_out,
+    }
+
+
+def collect_rated_results(queries: list[dict], search_kwargs: dict | None = None, judge_model=None, max_chars: int = 500) -> dict:
+    """Busca cada query UNA vez y puntúa sus resultados (sin agente): base del barrido de score."""
+    kwargs = {**DEFAULT_SEARCH_KWARGS, **(search_kwargs or {})}
+    collected = {}
+    for q in queries:
+        raw = tavily_raw_search(
+            q["query"],
+            max_results=kwargs.get("max_results", 5),
+            topic=kwargs.get("topic", "general"),
+            search_depth=kwargs.get("search_depth", "basic"),
+        )
+        results = raw.get("results", [])
+        rated = rate_results(q["query"], results, judge_model, max_chars)
+        items = [
+            {"score": r.get("score") or 0, "relevancia": v["relevancia"], "titulo": r.get("title")}
+            for r, v in zip(results, rated["valoraciones"] or [{"relevancia": None}] * len(results))
+        ]
+        collected[q["query"]] = {"items": items, "has_answer": q.get("has_answer", True)}
+    return collected
+
+
+def score_threshold_sweep(collected: dict, thresholds: list[float]) -> list[dict]:
+    """Para cada umbral: resultados que se conservan, recall de los relevantes (>=2) y basura descartada."""
+    rows = []
+    for t in thresholds:
+        kept = relevant_kept = relevant_total = irrelevant_dropped = irrelevant_total = 0
+        empty_with_answer = empty_without_answer = 0
+        for info in collected.values():
+            items = [i for i in info["items"] if i["relevancia"] is not None]
+            survivors = [i for i in items if i["score"] >= t]
+            kept += len(survivors)
+            relevant_total += sum(i["relevancia"] >= 2 for i in items)
+            relevant_kept += sum(i["relevancia"] >= 2 for i in survivors)
+            irrelevant_total += sum(i["relevancia"] < 2 for i in items)
+            irrelevant_dropped += sum(i["relevancia"] < 2 and i["score"] < t for i in items)
+            if not survivors:
+                if info["has_answer"]:
+                    empty_with_answer += 1
+                else:
+                    empty_without_answer += 1
+        rows.append(
+            {
+                "umbral": t,
+                "conservados": kept,
+                "recall_relevantes": relevant_kept / relevant_total if relevant_total else None,
+                "basura_descartada": irrelevant_dropped / irrelevant_total if irrelevant_total else None,
+                "vacias_con_respuesta": empty_with_answer,
+                "vacias_sin_respuesta": empty_without_answer,
+            }
+        )
+    return rows
+
+
+def choose_min_score(sweep: list[dict], min_recall: float = 0.95, default: float = 0.0) -> float:
+    """Umbral más alto que conserva al menos min_recall de los resultados relevantes.
+
+    Sustituye a elegir el umbral a mano: prioriza no perder información útil.
+    """
+    valid = [r["umbral"] for r in sweep if r["recall_relevantes"] is not None and r["recall_relevantes"] >= min_recall]
+    return max(valid) if valid else default
+
+
+def print_score_sweep(rows: list[dict]):
+    """Tabla del barrido: buscamos un umbral con recall alto y buena limpieza de basura."""
+    pct = lambda x: "  n/a" if x is None else f"{x:5.0%}"
+    print(f"{'Umbral':>7} {'Conservados':>12} {'Recall relev.':>14} {'Basura descartada':>18} {'Vacías (hay resp.)':>19} {'Vacías (sin resp.)':>19}")
+    for r in rows:
+        print(
+            f"{r['umbral']:>7.2f} {r['conservados']:>12} {pct(r['recall_relevantes']):>14} "
+            f"{pct(r['basura_descartada']):>18} {r['vacias_con_respuesta']:>19} {r['vacias_sin_respuesta']:>19}"
+        )
+
+
+def evaluate_variant(name: str, agent, queries: list[dict], judge_model=None, thread_prefix: str | None = None) -> dict:
+    """Ejecuta un agente sobre las queries y mide coste, tokens, resultados inyectados y calidad."""
+    rows, results = [], []
+    for i, q in enumerate(queries):
+        result = run_agent(agent, q["query"], thread_id=f"{thread_prefix}-{i}" if thread_prefix else None)
+        results.append(result)
+        cost = cost_breakdown(result)
+        outputs = [o for o in get_tavily_outputs(result) if "results" in o]
+        injected = [r for o in outputs for r in o["results"]]
+
+        precision = None
+        if injected and judge_model is not None:  # calidad medida por un evaluador independiente
+            ratings = []
+            for o in outputs:
+                ratings += rate_results(o.get("query", q["query"]), o["results"], judge_model)["valoraciones"]
+            valid = [v["relevancia"] for v in ratings if v["relevancia"] is not None]
+            precision = sum(v >= 2 for v in valid) / len(valid) if valid else None
+
+        rows.append(
+            {
+                "query": q["query"],
+                "usó_web": used_search(result),
+                "input": count_tokens(result)["input"],
+                "output": count_tokens(result)["output"],
+                "toolmessage_tokens": toolmessage_tokens(result)["toolmessage_tokens"] if used_search(result) else 0,
+                "resultados_inyectados": len(injected),
+                "busqueda_vacia": bool(outputs) and not injected,
+                "precision": precision,
+                "has_answer": q.get("has_answer", True),
+                **{k: cost[k] for k in ("agente_usd", "juez_usd", "total_usd", "juez_tokens", "cache_read", "cache_write")},
+            }
+        )
+    return {"name": name, "rows": rows, "results": results}
+
+
+def summarize_rows(evaluation: dict) -> dict:
+    """Medias de una variante (sobre las queries que usaron la web)."""
+    rows = evaluation["rows"]
+    web = [r for r in rows if r["usó_web"]] or rows
+    mean = lambda key, data: sum(r[key] for r in data) / len(data) if data else 0
+    precisions = [r["precision"] for r in web if r["precision"] is not None]
+    return {
+        "variante": evaluation["name"],
+        "coste_total_usd": sum(r["total_usd"] for r in rows),
+        "coste_medio_usd": mean("total_usd", rows),
+        "input_medio": mean("input", rows),
+        "toolmessage_medio": mean("toolmessage_tokens", web),
+        "resultados_medios": mean("resultados_inyectados", web),
+        "busquedas_vacias": sum(r["busqueda_vacia"] for r in rows),
+        "precision": sum(precisions) / len(precisions) if precisions else None,
+        "juez_tokens": sum(r["juez_tokens"] for r in rows),
+    }
+
+
+def print_variant_comparison(evaluations: list[dict], base_name: str = "base"):
+    """Tabla comparativa con el ahorro (%) de coste respecto a la variante base."""
+    summaries = [summarize_rows(e) for e in evaluations]
+    base = next((s for s in summaries if s["variante"] == base_name), summaries[0])
+    print(f"{'Variante':<14} {'Coste total':>11} {'vs base':>8} {'Input medio':>12} {'ToolMsg':>8} {'Result.':>8} {'Vacías':>7} {'Precisión':>10} {'Tokens juez':>12}")
+    for s in summaries:
+        saving = 1 - s["coste_total_usd"] / base["coste_total_usd"] if base["coste_total_usd"] else 0
+        prec = "n/a" if s["precision"] is None else f"{s['precision']:.0%}"
+        print(
+            f"{s['variante']:<14} ${s['coste_total_usd']:>9.5f} {saving:>+8.0%} {s['input_medio']:>12.0f} "
+            f"{s['toolmessage_medio']:>8.0f} {s['resultados_medios']:>8.1f} {s['busquedas_vacias']:>7} {prec:>10} {s['juez_tokens']:>12}"
+        )
+
+
+def run_conversation(agent, questions: list[str], thread_id: str = "conversacion") -> list[dict]:
+    """Hace varias preguntas seguidas en el mismo hilo (el prefijo crece y la caché puede activarse)."""
+    turns = []
+    for i, question in enumerate(questions, 1):
+        result = run_agent(agent, question, thread_id=thread_id)
+        turns.append({"turno": i, "pregunta": question, "result": result, "coste": cost_breakdown(result)})
+    return turns
+
+
+def print_cache_report(turns: list[dict]):
+    """Por turno: tokens de entrada, leídos de caché, escritos en caché y coste."""
+    print(f"{'Turno':<6} {'Input':>7} {'Normal':>8} {'Cache read':>11} {'Cache write':>12} {'USD':>10}")
+    for t in turns:
+        c = t["coste"]
+        total_in = c["input_normal"] + c["cache_read"] + c["cache_write"]
+        print(f"{t['turno']:<6} {total_in:>7} {c['input_normal']:>8} {c['cache_read']:>11} {c['cache_write']:>12} ${c['total_usd']:>9.5f}")
+    print(f"\nTotal: ${sum(t['coste']['total_usd'] for t in turns):.5f}  (mínimo cacheable Haiku 4.5: {MIN_CACHEABLE_TOKENS} tokens)")
 
 
 # ---------------------------------------------------------------------------
